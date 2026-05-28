@@ -1,0 +1,726 @@
+---
+title: "Ec50FinalProjectPt2(Code)"
+author: "Joanna Zhang"
+date: "2026-05-01"
+output: pdf_document
+---
+```{r}
+install.packages("usethis")
+library(usethis)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(haven)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(stringr)
+library(broom)
+library(knitr)
+
+# Folder where all tables/figures will be saved. This makes the empirical
+# results easy to insert into the memo.
+out_dir <- "electchester_outputs"
+dir.create(out_dir, showWarnings = FALSE)
+
+# Helper functions for summary statistics. These avoid misleading Inf/-Inf
+# values when a variable is entirely missing in a small subgroup.
+mean_na <- function(x) {
+  if (all(is.na(x))) NA_real_ else mean(x, na.rm = TRUE)
+}
+
+sd_na <- function(x) {
+  if (sum(!is.na(x)) <= 1) NA_real_ else sd(x, na.rm = TRUE)
+}
+
+min_na <- function(x) {
+  if (all(is.na(x))) NA_real_ else min(x, na.rm = TRUE)
+}
+
+max_na <- function(x) {
+  if (all(is.na(x))) NA_real_ else max(x, na.rm = TRUE)
+}
+
+# Opportunity Atlas identifies tracts using three numeric fields:
+# state FIPS, county FIPS, and 2010 tract FIPS. This function converts them
+# into the standard 11-digit Census tract GEOID.
+make_geoid <- function(df) {
+  df %>%
+    mutate(
+      geoid = sprintf(
+        "%02.0f%03.0f%06.0f",
+        as.numeric(state),
+        as.numeric(county),
+        as.numeric(tract)
+      )
+    )
+}
+
+# Save every table as a CSV for easy insertion into the final memo.
+write_table <- function(df, filename) {
+  readr::write_csv(df, file.path(out_dir, filename))
+  df
+}
+
+# Choose the first data path that exists. This makes the file work whether
+# atlas.dta is on the Desktop or in Downloads.
+first_existing_path <- function(paths) {
+  existing <- paths[file.exists(path.expand(paths))]
+  if (length(existing) == 0) {
+    return(NA_character_)
+  }
+  path.expand(existing[1])
+}
+```
+
+# 1. Load Opportunity Atlas Data
+```{r load-data}
+# Edit this list if you move the file somewhere else.
+atlas_candidates <- c(
+  "~/Desktop/atlas (1).dta",
+  "~/Desktop/atlas.dta",
+  "~/Downloads/atlas (1).dta",
+  "~/Downloads/atlas.dta",
+  "/Users/joannazhang/Downloads/atlas.dta"
+)
+
+atlas_path <- first_existing_path(atlas_candidates)
+
+if (is.na(atlas_path)) {
+  stop("Could not find atlas.dta. Update atlas_candidates in the load-data chunk.")
+}
+
+cat("Using atlas file:", atlas_path, "\n")
+
+atlas_raw <- read_dta(atlas_path)
+
+atlas <- atlas_raw %>%
+  make_geoid()
+
+# Queens County, NY has state FIPS 36 and county FIPS 081.
+# I limit the main geographic universe to Queens because Electchester and
+# Pomonok are both in Queens, and because a county-level comparison is more
+# locally meaningful than comparing one tract to the entire United States.
+queens <- atlas %>%
+  filter(state == 36, county == 81)
+
+cat("National tract rows:", nrow(atlas), "\n")
+cat("Queens tract rows:", nrow(queens), "\n")
+cat("Number of variables in Queens data:", ncol(queens), "\n")
+
+# Quick data check: these should be 11-character strings beginning with 36081.
+head(queens$geoid)
+```
+
+# 2. Define Electchester and Nearby Comparison Tracts
+
+Defining the treatment and control groups, I'm use 2010 Census
+tracts because the Opportunity Atlas uses 2010 tract definitions.
+
+The key tract definitions are:
+
+- `36081122701`: Electchester / Mitchell-Lama cooperative housing area.
+- `36081122702`: Pomonok Houses / NYCHA area.
+
+These tract IDs were checked with the Census Geocoder using 2010 Census
+geography. The nearby comparison group is a small set of central Queens tracts
+around Flushing, Fresh Meadows, Kew Gardens Hills, and the Queens College area.
+
+```{r define-tracts}
+electchester_tracts <- c("36081122701")
+pomonok_tracts <- c("36081122702")
+
+# Nearby comparison tracts are not a causal control group. They are a local
+# benchmark that helps answer: "How unusual are Electchester and Pomonok relative
+# to nearby central Queens?"
+nearby_comparison_tracts <- c(
+  "36081077902",
+  "36081120300",
+  "36081120500",
+  "36081120700",
+  "36081121500",
+  "36081122300",
+  "36081124100",
+  "36081124700",
+  "36081125700"
+)
+
+tract_key <- bind_rows(
+  tibble(
+    geoid = electchester_tracts,
+    group = "Electchester",
+    tract_note = "Mitchell-Lama limited-equity cooperative housing; Local 3 / Electchester area"
+  ),
+  tibble(
+    geoid = pomonok_tracts,
+    group = "Pomonok Houses",
+    tract_note = "Nearby NYCHA public housing comparison tract"
+  ),
+  tibble(
+    geoid = nearby_comparison_tracts,
+    group = "Nearby comparison tracts",
+    tract_note = "Nearby Flushing/Fresh Meadows/Kew Gardens Hills/Queens College area tracts"
+  )
+) %>%
+  mutate(
+    group = factor(
+      group,
+      levels = c("Electchester", "Pomonok Houses", "Nearby comparison tracts")
+    )
+  )
+
+# Verify that the GEOIDs in tract_key actually exist in atlas.dta.
+matched_tracts <- queens %>%
+  filter(geoid %in% tract_key$geoid) %>%
+  select(geoid, tract, tract_name, kfr_pooled_pooled_p25)
+
+write_table(matched_tracts, "table_0_matched_tracts.csv")
+kable(matched_tracts)
+
+study <- queens %>%
+  inner_join(tract_key, by = "geoid")
+
+write_table(tract_key, "tract_key.csv")
+kable(tract_key)
+```
+
+# 3. Define Outcomes and Covariates
+
+I'm defining the variables used in the empirical analysis. The main outcome is `kfr_pooled_pooled_p25`, the mean adult household income rank for children from low-income families. I also examine race-specific household income ranks, gender-specific individual income ranks, incarceration, and neighborhood covariates that proxy for possible mechanisms.
+
+```{r variable-lists}
+# Main pooled outcome: upward mobility for children from low-income families.
+main_outcome <- "kfr_pooled_pooled_p25"
+
+# Race-specific versions of the same household-income-rank outcome.
+race_outcomes <- c(
+  "kfr_asian_pooled_p25",
+  "kfr_black_pooled_p25",
+  "kfr_hisp_pooled_p25",
+  "kfr_white_pooled_p25"
+)
+# outcomes are KIR, not KFR. KIR is individual income rank; KFR is household
+# income rank.
+gender_outcomes <- c(
+  "kir_pooled_male_p25",
+  "kir_pooled_female_p25"
+)
+
+# incar outcomes measure the fraction incarcerated on April 1, 2010.
+incarceration_outcomes <- c(
+  "jail_pooled_pooled_p25",
+  "jail_pooled_male_p25",
+  "jail_pooled_female_p25"
+)
+
+# mech/covariate variables. These are not causal mechanisms by themselves;
+# they are observable tract characteristics that help test whether the data are
+# consistent with the housing-stability/social-capital hypothesis.
+mechanism_vars <- c(
+  "poor_share2000",
+  "hhinc_mean2000",
+  "emp2000",
+  "singleparent_share2000",
+  "foreign_share2010",
+  "frac_coll_plus2000",
+  "rent_twobed2015",
+  "homeownership2010",
+  "share_asian2000",
+  "share_black2000",
+  "share_hisp2000",
+  "share_white2000"
+)
+
+summary_vars <- c(
+  main_outcome,
+  race_outcomes,
+  gender_outcomes,
+  incarceration_outcomes,
+  mechanism_vars
+)
+
+# kep only variables that are actually present in this version of atlas.dta.
+summary_vars <- summary_vars[summary_vars %in% names(study)]
+
+# fail early if the main outcome is missing, since the entire project depends on it.
+if (!(main_outcome %in% names(study))) {
+  stop("Main outcome kfr_pooled_pooled_p25 is missing from atlas.dta.")
+}
+```
+
+# 4. Summary Statistics Table
+
+This table's goal is to reports the number of non-missing observations, mean, standard deviation, minimum, maximum,and percent missing for each variable used below.
+
+```{r summary-stats}
+summary_stats <- study %>%
+  summarise(
+    across(
+      .cols = all_of(summary_vars),
+      .fns = list(
+        nobs = ~ sum(!is.na(.x)),
+        mean = mean_na,
+        sd = sd_na,
+        min = min_na,
+        max = max_na,
+        pct_na = ~ mean(is.na(.x)) * 100
+      ),
+      .names = "{.col}_{.fn}"
+    )
+  ) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("Variable", ".value"),
+    names_pattern = "(.*)_(nobs|mean|sd|min|max|pct_na)"
+  )
+
+write_table(summary_stats, "table_1_summary_stats.csv")
+kable(summary_stats %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+```
+
+# 5. Map-Based / Distributional Evidence
+
+Goal is to approximates the visual logic of the Opportunity Atlas map. Instead of a literal map, the histogram places Electchester and Pomonok inside the full distribution of Queens tracts. This is useful for the memo because it shows
+whether these tracts are unusually high or low within the county.
+
+```{r map-style-evidence, fig.width=8, fig.height=5}
+plot_data <- queens %>%
+  mutate(
+    tract_type = case_when(
+      geoid %in% electchester_tracts ~ "Electchester",
+      geoid %in% pomonok_tracts ~ "Pomonok Houses",
+      geoid %in% nearby_comparison_tracts ~ "Nearby comparison",
+      TRUE ~ "Other Queens tracts"
+    )
+  )
+
+elect_val <- plot_data %>%
+  filter(geoid %in% electchester_tracts) %>%
+  pull(kfr_pooled_pooled_p25)
+
+pom_val <- plot_data %>%
+  filter(geoid %in% pomonok_tracts) %>%
+  pull(kfr_pooled_pooled_p25)
+
+p_hist <- ggplot(plot_data, aes(x = kfr_pooled_pooled_p25)) +
+  geom_histogram(bins = 35, fill = "gray75", color = "white") +
+  geom_vline(xintercept = elect_val, linewidth = 1) +
+  geom_vline(xintercept = pom_val, linetype = "dashed", linewidth = 1) +
+  labs(
+    title = "Distribution of Upward Mobility Across Queens Tracts",
+    subtitle = "Solid line = Electchester; dashed line = Pomonok Houses",
+    x = "Mean household income rank in adulthood (parents at p25)",
+    y = "Number of tracts"
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(file.path(out_dir, "figure_1_queens_distribution.png"), p_hist, width = 8, height = 5)
+p_hist
+```
+
+# 6. Group Means and Differences
+
+We are testing the core hypothesiss. If the Electchester story is consistent with the data, Electchester should have higher upward mobility than Pomonok and possibly lower incarceration/higher employment. The nearby
+comparison group helps show whether Electchester is high relative to the local area, not just relative to Pomonok.
+
+```{r group-means}
+group_means <- study %>%
+  group_by(group) %>%
+  summarise(
+    n_tracts = n(),
+    across(all_of(summary_vars), mean_na),
+    .groups = "drop"
+  )
+
+write_table(group_means, "table_2_group_means.csv")
+kable(group_means %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+```
+
+```{r differences-vs-electchester}
+electchester_values <- group_means %>%
+  filter(group == "Electchester")
+
+diff_vars <- setdiff(names(group_means), c("group", "n_tracts"))
+
+electchester_differences <- group_means %>%
+  filter(group != "Electchester") %>%
+  transmute(
+    comparison_group = as.character(group),
+    across(
+      all_of(diff_vars),
+      ~ electchester_values[[cur_column()]][1] - .x
+    )
+  )
+
+write_table(electchester_differences, "table_3_electchester_differences.csv")
+kable(electchester_differences %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+```
+
+# 7. Race-Specific Analysis
+
+This code is checking whether the Electchester/Pomonok difference is only a pooled demographic-composition pattern. If the Electchester advantage is still
+visible within racial groups, that is more consistent with a place-based mechanism. If it disappears within race groups, composition may explain more of the pooled difference.
+
+```{r race-conditioning}
+race_table <- study %>%
+  select(group, geoid, all_of(race_outcomes)) %>%
+  pivot_longer(
+    cols = all_of(race_outcomes),
+    names_to = "race",
+    values_to = "household_income_rank"
+  ) %>%
+  mutate(
+    race = race %>%
+      str_remove("^kfr_") %>%
+      str_remove("_pooled_p25") %>%
+      str_to_title()
+  ) %>%
+  group_by(group, race) %>%
+  summarise(
+    mean_income_rank = mean_na(household_income_rank),
+    n_nonmissing = sum(!is.na(household_income_rank)),
+    .groups = "drop"
+  )
+
+write_table(race_table, "table_4_race_conditioning.csv")
+kable(race_table %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+```
+
+```{r race-plot, fig.width=8, fig.height=5}
+p_race <- ggplot(race_table, aes(x = race, y = mean_income_rank, color = group, group = group)) +
+  geom_point(size = 3) +
+  geom_line(alpha = 0.5) +
+  labs(
+    title = "Race-Specific Upward Mobility",
+    subtitle = "Household income rank for children from low-income families",
+    x = NULL,
+    y = "Mean household income rank",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(out_dir, "figure_2_race_conditioning.png"), p_race, width = 8, height = 5)
+p_race
+```
+
+# 8. Gender-Specific Analysis
+
+Conditioning on the gender, we are exploring the ways in which mean individual income rank may differ conditional on gender
+
+
+```{r gender-conditioning}
+gender_table <- study %>%
+  select(group, geoid, all_of(gender_outcomes)) %>%
+  pivot_longer(
+    cols = all_of(gender_outcomes),
+    names_to = "gender",
+    values_to = "individual_income_rank"
+  ) %>%
+  mutate(
+    gender = case_when(
+      gender == "kir_pooled_male_p25" ~ "Male",
+      gender == "kir_pooled_female_p25" ~ "Female",
+      TRUE ~ gender
+    )
+  ) %>%
+  group_by(group, gender) %>%
+  summarise(
+    mean_individual_income_rank = mean_na(individual_income_rank),
+    n_nonmissing = sum(!is.na(individual_income_rank)),
+    .groups = "drop"
+  )
+
+write_table(gender_table, "table_5_gender_conditioning.csv")
+kable(gender_table %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+```
+
+```{r gender-plot, fig.width=8, fig.height=5}
+p_gender <- ggplot(gender_table, aes(x = gender, y = mean_individual_income_rank, color = group, group = group)) +
+  geom_point(size = 3) +
+  geom_line(alpha = 0.5) +
+  labs(
+    title = "Gender-Specific Individual Income Rank",
+    subtitle = "Individual income rank for children from low-income families",
+    x = NULL,
+    y = "Mean individual income rank",
+    color = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+ggsave(file.path(out_dir, "figure_3_gender_conditioning.png"), p_gender, width = 8, height = 5)
+p_gender
+```
+
+# 9. Incarceration and Employment Comparisons
+
+The hypothesis predicts not only higher income, but also stronger adult employment and lower incarceration. In this table our goal is to compares those outcomes across the three local groups.
+
+```{r incarceration-employment}
+incarceration_employment <- study %>%
+  group_by(group) %>%
+  summarise(
+    jail_pooled_pooled_p25 = mean_na(jail_pooled_pooled_p25),
+    jail_pooled_male_p25 = mean_na(jail_pooled_male_p25),
+    jail_pooled_female_p25 = mean_na(jail_pooled_female_p25),
+    emp2000 = mean_na(emp2000),
+    .groups = "drop"
+  )
+
+write_table(incarceration_employment, "table_6_incarceration_employment.csv")
+kable(incarceration_employment %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+```
+
+# 10. Mechanism Scatterplots
+
+These scatterplots use all Queens tracts to show broader associations between upward mobility and candidate mechanisms. Electchester and Pomonok arehighlighted. These plots are correlational, but they help evaluate whether the
+mechanisms in the causal story line up with the data.
+
+```{r mechanism-plots, fig.width=7, fig.height=5}
+study_labels <- study %>%
+  mutate(
+    plot_label = case_when(
+      group == "Electchester" ~ "Electchester",
+      group == "Pomonok Houses" ~ "Pomonok",
+      TRUE ~ ""
+    )
+  )
+
+plot_mechanism <- function(xvar, xlab, filename) {
+  p <- ggplot(queens, aes(x = .data[[xvar]], y = kfr_pooled_pooled_p25)) +
+    geom_point(color = "gray60", alpha = 0.45, size = 1.8) +
+    geom_point(data = study, aes(color = group), size = 3) +
+    geom_text(
+      data = study_labels %>% filter(plot_label != ""),
+      aes(label = plot_label, color = group),
+      vjust = -0.7,
+      size = 3,
+      show.legend = FALSE
+    ) +
+    geom_smooth(method = "lm", se = FALSE, color = "black", linewidth = 0.5) +
+    labs(
+      title = paste("Upward Mobility and", xlab, "in Queens"),
+      x = xlab,
+      y = "Mean household income rank",
+      color = NULL
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "bottom")
+
+  ggsave(file.path(out_dir, filename), p, width = 7, height = 5)
+  p
+}
+
+plot_mechanism("poor_share2000", "poverty share in 2000", "figure_4_poverty.png")
+plot_mechanism("hhinc_mean2000", "mean household income in 2000", "figure_5_hhinc.png")
+plot_mechanism("emp2000", "employment rate in 2000", "figure_6_emp.png")
+plot_mechanism("singleparent_share2000", "single-parent share in 2000", "figure_7_singleparent.png")
+plot_mechanism("frac_coll_plus2000", "college-plus share in 2000", "figure_8_college.png")
+```
+
+# 11. Multivariate Regression
+
+These regressions use all Queens tracts and include indicators for Electchester and Pomonok. The coefficients on those indicators should not be interpreted as causal effects. The goal is to answer whether these tracts look high or
+low relative to other Queens tracts before and after adjusting for observable neighborhood characteristics?
+
+```{r regressions}
+regression_data <- queens %>%
+  mutate(
+    electchester = as.integer(geoid %in% electchester_tracts),
+    pomonok = as.integer(geoid %in% pomonok_tracts)
+  ) %>%
+  select(
+    geoid,
+    kfr_pooled_pooled_p25,
+    electchester,
+    pomonok,
+    poor_share2000,
+    hhinc_mean2000,
+    emp2000,
+    singleparent_share2000,
+    foreign_share2010,
+    frac_coll_plus2000,
+    share_asian2000,
+    share_black2000,
+    share_hisp2000
+  ) %>%
+  drop_na()
+
+# Model 1: simple descriptive comparison to all other Queens tracts.
+model_1 <- lm(
+  kfr_pooled_pooled_p25 ~ electchester + pomonok,
+  data = regression_data
+)
+
+# Model 2: controls for candidate mechanisms/neighborhood characteristics.
+model_2 <- lm(
+  kfr_pooled_pooled_p25 ~ electchester + pomonok +
+    poor_share2000 + hhinc_mean2000 + emp2000 +
+    singleparent_share2000 + foreign_share2010 + frac_coll_plus2000,
+  data = regression_data
+)
+
+# Model 3: adds racial/ethnic composition controls. If Electchester/Pomonok
+# coefficients shrink a lot, that suggests composition explains part of the
+# raw tract difference.
+model_3 <- lm(
+  kfr_pooled_pooled_p25 ~ electchester + pomonok +
+    poor_share2000 + hhinc_mean2000 + emp2000 +
+    singleparent_share2000 + foreign_share2010 + frac_coll_plus2000 +
+    share_asian2000 + share_black2000 + share_hisp2000,
+  data = regression_data
+)
+
+regression_table <- bind_rows(
+  tidy(model_1) %>% mutate(model = "1. Indicators only"),
+  tidy(model_2) %>% mutate(model = "2. + neighborhood covariates"),
+  tidy(model_3) %>% mutate(model = "3. + racial composition")
+) %>%
+  select(model, term, estimate, std.error, statistic, p.value)
+
+write_table(regression_table, "table_7_regressions.csv")
+kable(regression_table %>% mutate(across(where(is.numeric), ~ round(.x, 4))))
+```
+
+```{r regression-fit}
+regression_fit <- bind_rows(
+  glance(model_1) %>% mutate(model = "1. Indicators only"),
+  glance(model_2) %>% mutate(model = "2. + neighborhood covariates"),
+  glance(model_3) %>% mutate(model = "3. + racial composition")
+) %>%
+  select(model, nobs, r.squared, adj.r.squared, sigma)
+
+write_table(regression_fit, "table_8_regression_fit.csv")
+kable(regression_fit %>% mutate(across(where(is.numeric), ~ round(.x, 4))))
+```
+
+# 12. Predicted Values and Residual-Style Comparison
+
+Using Model 3, I'm comparing observed upward mobility to predicted upward mobility after controlling for neighborhood characteristics and racial
+composition. A positive residual means a tract performs better than predicted by the included covariates; a negative residual means it performs worse.
+
+```{r predictions-from-model}
+regression_data <- regression_data %>%
+  mutate(
+    yhat_model3 = predict(model_3, newdata = regression_data),
+    residual_model3 = kfr_pooled_pooled_p25 - yhat_model3
+  )
+
+special_tracts <- regression_data %>%
+  filter(electchester == 1 | pomonok == 1) %>%
+  select(geoid, electchester, pomonok, kfr_pooled_pooled_p25, yhat_model3, residual_model3)
+
+write_table(special_tracts, "table_9_special_tract_predictions.csv")
+kable(special_tracts %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+```
+
+# 14. Optional Holdout / Lockbox Validation
+
+The prompt requires an out-of-sample validation exercise using the lockbox file.
+This code supports two cases:
+
+```{r lockbox-validation}
+#troublshoot because directory had issues and couldn't be resolved in OH, we went with this approach of using file paths
+lockbox_candidates <- c(
+  "~/Desktop/lockbox_atlas.dta",
+  "~/Desktop/atlas_lockbox.dta",
+  "~/Downloads/lockbox_atlas.dta",
+  "~/Downloads/atlas_lockbox.dta",
+  "/Users/joannazhang/Downloads/atlas_lockbox.dta"
+)
+
+lockbox_path <- first_existing_path(lockbox_candidates)
+
+if (is.na(lockbox_path)) {
+  cat("No lockbox file found. Skipping holdout validation.\n")
+} else {
+  cat("Using lockbox file:", lockbox_path, "\n")
+  lockbox_raw <- read_dta(lockbox_path)
+
+  if (all(c("state", "county", "tract") %in% names(lockbox_raw))) {
+    # Tract-level lockbox file: this is the ideal case for the final memo.
+    lockbox <- lockbox_raw %>%
+      make_geoid()
+
+    lockbox_outcome <- intersect(
+      c("lockbox_kfr_pooled_pooled_p25", "kfr_pooled_pooled_p25", "kfr_actual"),
+      names(lockbox)
+    )[1]
+
+    if (is.na(lockbox_outcome)) {
+      stop("Could not identify a lockbox income-rank outcome variable.")
+    }
+
+    lockbox_study <- lockbox %>%
+      inner_join(tract_key, by = "geoid")
+
+    lockbox_table <- lockbox_study %>%
+      group_by(group) %>%
+      summarise(
+        n_tracts = n(),
+        lockbox_mean_income_rank = mean_na(.data[[lockbox_outcome]]),
+        .groups = "drop"
+      )
+
+    write_table(lockbox_table, "table_12_lockbox_validation.csv")
+    kable(lockbox_table %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+  } else if ("geoid" %in% names(lockbox_raw) && max(lockbox_raw$geoid, na.rm = TRUE) < 1000000) {
+    # The atlas_lockbox.dta currently observed in Downloads appears to be
+    # county-level: Queens is geoid 36081, not an 11-digit tract GEOID.
+    county_lockbox <- lockbox_raw %>%
+      mutate(county_geoid = sprintf("%05.0f", as.numeric(geoid))) %>%
+      filter(county_geoid == "36081")
+
+    cat(
+      "Lockbox file appears to be county-level, not tract-level.\n",
+      "This can be reported as a Queens County sanity check, but it does not\n",
+      "validate the Electchester vs. Pomonok tract comparison required by the prompt.\n"
+    )
+
+    write_table(county_lockbox, "table_12_lockbox_county_only.csv")
+    kable(county_lockbox %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+  } else if ("geoid" %in% names(lockbox_raw)) {
+    # Some tract-level files store the 11-digit tract GEOID as one numeric/string
+    # variable rather than separate state/county/tract columns.
+    lockbox <- lockbox_raw %>%
+      mutate(geoid = sprintf("%011.0f", as.numeric(geoid)))
+
+    lockbox_outcome <- intersect(
+      c("lockbox_kfr_pooled_pooled_p25", "kfr_pooled_pooled_p25", "kfr_actual"),
+      names(lockbox)
+    )[1]
+
+    if (is.na(lockbox_outcome)) {
+      stop("Could not identify a lockbox income-rank outcome variable.")
+    }
+
+    lockbox_table <- lockbox %>%
+      inner_join(tract_key, by = "geoid") %>%
+      group_by(group) %>%
+      summarise(
+        n_tracts = n(),
+        lockbox_mean_income_rank = mean_na(.data[[lockbox_outcome]]),
+        .groups = "drop"
+      )
+
+    write_table(lockbox_table, "table_12_lockbox_validation.csv")
+    kable(lockbox_table %>% mutate(across(where(is.numeric), ~ round(.x, 3))))
+
+  } else {
+    cat("Lockbox file found, but tract identifiers were not recognized.\n")
+    cat("Variables in lockbox file:\n")
+    print(names(lockbox_raw))
+  }
+}
+
+
+```
+
+
+
+
